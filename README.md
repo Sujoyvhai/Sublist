@@ -32,12 +32,31 @@ A simple, fast subdomain enumeration tool written in pure Python. No third-party
 ## Installation
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/Sujoyvhai/Sublist.git
 cd Sublist
 python Sublist.py
 ```
 
 Running `python Sublist.py` with no arguments prints the full help.
+
+Note
+## Run Sublist from Any Folder
+
+Go to the folder that contains `Sublist.py`, then run:
+
+```bash
+ls -l Sublist.py
+sudo ln -sf "$(pwd)/Sublist.py" /usr/local/bin/Sublist
+chmod +x Sublist.py
+ls -l /usr/local/bin/Sublist
+Sublist
+```
+
+- `ls -l Sublist.py` checks that the file exists in the current folder.
+- `ln -sf` creates (or overwrites) a link named `Sublist` in `/usr/local/bin`.
+- `chmod +x` makes the script executable.
+- `ls -l /usr/local/bin/Sublist` verifies where the link points.
+- `Sublist` shows the banner and full help. Now you can run it from any folder, for example `Sublist -d example.com`.
 
 ## Usage
 
