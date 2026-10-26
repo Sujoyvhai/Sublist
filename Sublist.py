@@ -12,19 +12,32 @@ import concurrent.futures as cf
 import csv
 import itertools
 import json
+import os
 import random
 import re
+import shutil
 import socket
 import ssl
 import string
+import struct
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "Sujoy Karmakar"
+
+# ---- update settings -------------------------------------------------------
+# Used by `Sublist -update` when the tool was NOT installed with `git clone`.
+# Change this to your GitHub "username/repository" before publishing.
+REPO = "YOUR_GITHUB_USERNAME/Sublist"
+BRANCH = "main"
+SCRIPT_NAME = "Sublist.py"
+RAW_URL = "https://raw.githubusercontent.com/{repo}/{branch}/{script}"
+# ----------------------------------------------------------------------------
 
 BANNER = r"""
  ____        _     _ _     _
@@ -39,13 +52,39 @@ UA = "Mozilla/5.0 (compatible; Sublist/{})".format(__version__)
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?$")
 
-DEFAULT_WORDS = """www mail ftp smtp pop imap webmail admin api dev test staging stage beta demo
-portal blog shop store app apps cdn static assets img images media vpn remote secure login
-auth sso dashboard panel cpanel whm ns1 ns2 ns3 mx mx1 mx2 git gitlab jenkins ci jira wiki
-docs help support status monitor grafana kibana db mysql sql mongo redis backup old new v1 v2
-intranet internal mobile m web server host cloud ssh crm erp hr billing pay payment office
-exchange owa autodiscover autoconfig cms forum community news video download uploads files
-proxy gateway lb office365 sandbox uat prod production""".split()
+DEFAULT_WORDS = list(dict.fromkeys("""
+www www1 www2 www3 mail mail1 mail2 mail3 email mailer mailgate relay ftp ftp2 sftp smtp smtp1 smtp2
+pop pop3 imap webmail exchange owa autodiscover autoconfig lyncdiscover sip webex meet meeting
+conference zoom ns ns1 ns2 ns3 ns4 dns dns1 dns2 mx mx1 mx2 admin administrator adm admin1 admin2
+api api1 api2 api3 apis rest graphql ws soap rpc grpc dev dev1 dev2 develop development devel test
+test1 test2 testing tst qa qas staging stage stg beta alpha demo demo2 preview sandbox uat prod
+production pre preprod pre-prod live lab labs research training learn lms portal blog shop store
+shop2 app app1 app2 apps application mobile m wap mobile-api web web1 web2 server servers host hosts
+cdn cdn1 cdn2 static assets asset img image images media media2 video videos stream streaming radio
+tv files file download downloads upload uploads docs doc documentation help helpdesk support status
+monitor monitoring metrics grafana kibana prometheus nagios zabbix elk logs log splunk sentry
+analytics stats stat statistics tracking track ads ad adserver tag tags pixel report reports
+reporting bi data datalake warehouse etl airflow spark hadoop ml ai search solr elastic
+elasticsearch es kafka rabbitmq mq queue db db1 db2 database mysql sql mssql postgres postgresql
+pgsql oracle mongo mongodb redis memcache cache backup backups bak backup2 dr failover old new v1
+v2 v3 intranet internal intra private corp corporate extranet secure ssl login signin signup
+register registration auth oauth sso saml ldap ad adfs idp id identity accounts account profile
+user users member members my dashboard panel cpanel whm plesk webmin directadmin control manager
+manage console backend backoffice back-office office cms drupal wordpress wp joomla magento
+forum forums community board news press events event calendar cal careers jobs job partners
+partner affiliates affiliate vendor vendors supplier client clients customer customers b2b b2c
+vpn vpn1 vpn2 remote rdp ras citrix terminal desktop ts gateway gw proxy proxy1 lb loadbalancer
+router firewall fw ssh cloud storage nas san s3 share sharepoint onedrive drive box git gitlab
+github bitbucket svn cvs repo repos code ci cd jenkins build builds bamboo teamcity travis drone
+artifactory nexus registry docker k8s kubernetes rancher consul vault terraform ansible puppet
+chef jira confluence wiki kb knowledge tracker issues bugs bugzilla redmine trac crm erp hr hris
+payroll billing invoice invoices pay payment payments checkout cart orders order wallet bank
+banking mdm intune pbx voip phone maps map geo gis location tools tool util utils utility service
+services svc us eu uk de fr asia in au ca sg jp br origin edge cache1 cache2 mirror mirror1
+status2 health ping time ntp host1 host2 node1 node2 node3 master slave primary secondary
+standby test-env dev-api api-dev api-test api-staging api-prod staging-api student students
+library edu school hospital
+""".split()))
 
 
 # ------------------------------------------------------------------ helpers
@@ -67,7 +106,7 @@ class Spinner:
         for ch in itertools.cycle("|/-\\"):
             if self._stop.is_set():
                 break
-            sys.stderr.write("\r[*] {} {}".format(self.text, ch))
+            sys.stderr.write("\r[*] {} {}   ".format(self.text, ch))
             sys.stderr.flush()
             time.sleep(0.1)
 
@@ -85,7 +124,7 @@ class Spinner:
         if self._thread:
             self._stop.set()
             self._thread.join()
-            sys.stderr.write("\r" + " " * (len(self.text) + 12) + "\r")
+            sys.stderr.write("\r" + " " * 79 + "\r")
             sys.stderr.flush()
         return False
 
@@ -100,6 +139,8 @@ def clean(names, domain):
     """Normalize names and keep only valid subdomains of `domain`."""
     out = set()
     for n in names:
+        if not isinstance(n, str):
+            continue
         n = n.strip().lower().rstrip(".")
         n = re.sub(r"^\*\.", "", n)
         if n.endswith("." + domain) and DOMAIN_RE.match(n):
@@ -109,15 +150,25 @@ def clean(names, domain):
 
 # ------------------------------------------------------------ passive sources
 def src_crtsh(domain):
-    data = json.loads(http_get("https://crt.sh/?q=%25.{}&output=json".format(domain), 40))
+    data = json.loads(http_get("https://crt.sh/?q=%25.{}&output=json".format(domain), 30))
     names = []
     for row in data:
         names.extend(row.get("name_value", "").split("\n"))
     return names
 
 
+def src_certspotter(domain):
+    data = json.loads(http_get(
+        "https://api.certspotter.com/v1/issuances?domain={}"
+        "&include_subdomains=true&expand=dns_names".format(domain), 25))
+    names = []
+    for row in data:
+        names.extend(row.get("dns_names", []))
+    return names
+
+
 def src_hackertarget(domain):
-    text = http_get("https://api.hackertarget.com/hostsearch/?q={}".format(domain))
+    text = http_get("https://api.hackertarget.com/hostsearch/?q={}".format(domain), 20)
     if "error" in text.lower()[:50]:
         return []
     return [line.split(",")[0] for line in text.splitlines()]
@@ -125,56 +176,111 @@ def src_hackertarget(domain):
 
 def src_otx(domain):
     data = json.loads(http_get(
-        "https://otx.alienvault.com/api/v1/indicators/domain/{}/passive_dns".format(domain)))
+        "https://otx.alienvault.com/api/v1/indicators/domain/{}/passive_dns".format(domain), 25))
     return [r.get("hostname", "") for r in data.get("passive_dns", [])]
 
 
 def src_anubis(domain):
-    return json.loads(http_get("https://jldc.me/anubis/subdomains/{}".format(domain)))
+    return json.loads(http_get("https://jldc.me/anubis/subdomains/{}".format(domain), 20))
 
 
 def src_wayback(domain):
-    url = ("https://web.archive.org/cdx/search/cdx?url=*.{}&output=text"
-           "&fl=original&collapse=urlkey&limit=50000".format(domain))
+    url = ("https://web.archive.org/cdx/search/cdx?url={}&matchType=domain&output=text"
+           "&fl=original&collapse=urlkey&limit=20000".format(domain))
     names = []
-    for line in http_get(url, 60).splitlines():
-        m = re.match(r"^[a-z]+://([^/:?#]+)", line.strip().lower())
+    for line in http_get(url, 30).splitlines():
+        m = re.match(r"^[a-z]+://([^/:?#@]*@)?([^/:?#]+)", line.strip().lower())
         if m:
-            names.append(m.group(1))
+            names.append(m.group(2))
     return names
+
+
+def src_urlscan(domain):
+    data = json.loads(http_get(
+        "https://urlscan.io/api/v1/search/?q=domain:{}&size=100".format(domain), 25))
+    names = []
+    for r in data.get("results", []):
+        names.append(r.get("page", {}).get("domain", ""))
+        names.append(r.get("task", {}).get("domain", ""))
+    return names
+
+
+def src_rapiddns(domain):
+    html = http_get("https://rapiddns.io/subdomain/{}?full=1".format(domain), 25).lower()
+    return re.findall(r"([a-z0-9][a-z0-9.\-]*\.{})".format(re.escape(domain)), html)
+
+
+def src_threatminer(domain):
+    data = json.loads(http_get(
+        "https://api.threatminer.org/v2/domain.php?q={}&rt=5".format(domain), 25))
+    return data.get("results", [])
+
+
+def src_columbus(domain):
+    data = json.loads(http_get(
+        "https://columbus.elmasy.com/api/subdomains/{}".format(domain), 25))
+    return ["{}.{}".format(x, domain) for x in data if isinstance(x, str)]
 
 
 SOURCES = {
     "crtsh": src_crtsh,
+    "certspotter": src_certspotter,
     "hackertarget": src_hackertarget,
     "otx": src_otx,
     "anubis": src_anubis,
     "wayback": src_wayback,
+    "urlscan": src_urlscan,
+    "rapiddns": src_rapiddns,
+    "threatminer": src_threatminer,
+    "columbus": src_columbus,
 }
 
 
-def _run_source(fn, domain, retries=2):
-    """Run one source; retry once on failure. Failures are silent."""
-    for attempt in range(retries):
+def _run_source(fn, domain):
+    """Run one source. Retry once on a quick failure, never on a timeout."""
+    for attempt in (1, 2):
         try:
             return fn(domain)
-        except Exception:
+        except Exception as e:
+            timed_out = isinstance(e, (socket.timeout, TimeoutError)) or \
+                isinstance(getattr(e, "reason", None), socket.timeout)
+            if attempt == 2 or timed_out:
+                break
             time.sleep(1)
     return []
 
 
-def passive_enum(domain, quiet=False):
+def passive_enum(domain, quiet=False, deadline=40):
+    """Query all passive sources in parallel. Slow sources are cut off at
+    `deadline` seconds so one bad source can't block the whole scan."""
     found = set()
-    with Spinner("Loading", quiet):
-        with cf.ThreadPoolExecutor(max_workers=len(SOURCES)) as ex:
-            futs = [ex.submit(_run_source, fn, domain) for fn in SOURCES.values()]
-            for fut in cf.as_completed(futs):
-                try:
-                    found |= clean(fut.result(), domain)
-                except Exception:
-                    pass
-    log("[+] Passive sources: {} candidates".format(len(found)), quiet)
-    return found
+    lock = threading.Lock()
+
+    def worker(fn):
+        try:
+            names = clean(_run_source(fn, domain), domain)
+        except Exception:
+            names = set()
+        with lock:
+            found.update(names)
+
+    threads = [threading.Thread(target=worker, args=(fn,), daemon=True)
+               for fn in SOURCES.values()]
+    for t in threads:
+        t.start()
+
+    t0 = time.time()
+    with Spinner("Loading", quiet) as sp:
+        while time.time() - t0 < deadline and any(t.is_alive() for t in threads):
+            with lock:
+                n = len(found)
+            sp.text = "Loading ({} found)".format(n) if n else "Loading"
+            time.sleep(0.2)
+
+    with lock:
+        result = set(found)
+    log("[+] Passive sources: {} candidates".format(len(result)), quiet)
+    return result
 
 
 # ------------------------------------------------------------ active: brute
@@ -183,7 +289,7 @@ def load_words(path):
         return DEFAULT_WORDS
     with open(path, encoding="utf-8", errors="ignore") as f:
         words = [w.strip().lower() for w in f if w.strip() and not w.startswith("#")]
-    return [w for w in words if LABEL_RE.match(w)]
+    return [w for w in dict.fromkeys(words) if LABEL_RE.match(w)]
 
 
 def permutations(subs, domain):
@@ -200,14 +306,148 @@ def permutations(subs, domain):
     return out - set(subs)
 
 
-# ------------------------------------------------------------ DNS
-def resolve(host, timeout=3):
-    socket.setdefaulttimeout(timeout)
+# ------------------------------------------------------------ DNS (fast, raw UDP)
+DEFAULT_RESOLVERS = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "8.8.4.4", "1.0.0.1"]
+RESOLVERS = list(DEFAULT_RESOLVERS)
+USE_RAW = False
+
+
+def _build_query(name, qtype, qid):
+    header = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    qname = b"".join(struct.pack("B", len(p)) + p.encode("ascii")
+                     for p in name.rstrip(".").split("."))
+    return header + qname + b"\x00" + struct.pack(">HH", qtype, 1)
+
+
+def _skip_name(buf, off):
+    while True:
+        length = buf[off]
+        if length == 0:
+            return off + 1
+        if length & 0xC0 == 0xC0:
+            return off + 2
+        off += length + 1
+
+
+def _read_name(buf, off):
+    labels, hops = [], 0
+    while True:
+        length = buf[off]
+        if length == 0:
+            break
+        if length & 0xC0 == 0xC0:
+            off = ((length & 0x3F) << 8) | buf[off + 1]
+            hops += 1
+            if hops > 20:
+                raise ValueError("compression loop")
+            continue
+        labels.append(buf[off + 1:off + 1 + length].decode("ascii", "ignore"))
+        off += length + 1
+    return ".".join(labels)
+
+
+def _parse_response(buf):
+    if len(buf) < 12:
+        raise ValueError("short packet")
+    _id, flags, qd, an, _ns, _ar = struct.unpack(">HHHHHH", buf[:12])
+    rcode = flags & 0x000F
+    off = 12
+    for _ in range(qd):
+        off = _skip_name(buf, off) + 4
+    toks = []
+    for _ in range(an):
+        off = _skip_name(buf, off)
+        rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", buf[off:off + 10])
+        off += 10
+        rdata = buf[off:off + rdlen]
+        if rtype == 1 and rdlen == 4:
+            toks.append(socket.inet_ntoa(rdata))
+        elif rtype == 28 and rdlen == 16:
+            toks.append(socket.inet_ntop(socket.AF_INET6, rdata))
+        elif rtype == 5:
+            toks.append("cname:" + _read_name(buf, off).lower())
+        off += rdlen
+    return rcode, toks
+
+
+def dns_query(host, qtype, server, timeout=2.0):
+    qid = random.getrandbits(16)
+    pkt = _build_query(host, qtype, qid)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.settimeout(timeout)
+        s.sendto(pkt, (server, 53))
+        while True:
+            data, addr = s.recvfrom(4096)
+            if addr[0] == server and len(data) >= 12 and \
+                    struct.unpack(">H", data[:2])[0] == qid:
+                return _parse_response(data)
+    finally:
+        s.close()
+
+
+def resolve_raw(host, tries=3, timeout=2.0):
+    """Returns a list (empty = does not exist) or None if resolvers failed."""
+    for _ in range(tries):
+        server = random.choice(RESOLVERS)
+        try:
+            rcode, toks = dns_query(host, 1, server, timeout)
+            if rcode == 3:                      # NXDOMAIN
+                return []
+            if rcode != 0:                      # SERVFAIL / REFUSED -> retry
+                continue
+            if toks:
+                return sorted(set(toks))
+            rcode, toks = dns_query(host, 28, server, timeout)   # IPv6-only host?
+            return sorted(set(toks)) if rcode == 0 else []
+        except (OSError, ValueError, struct.error, IndexError):
+            continue
+    return None
+
+
+def resolve_system(host):
     try:
         infos = socket.getaddrinfo(host, None)
         return sorted({i[4][0] for i in infos})
     except (socket.gaierror, socket.timeout, UnicodeError, OSError):
         return []
+
+
+def resolve(host):
+    if USE_RAW:
+        r = resolve_raw(host)
+        if r is not None:
+            return r
+    return resolve_system(host)
+
+
+def init_dns(custom=None):
+    """Pick working resolvers. Falls back to the system resolver if UDP/53
+    to public resolvers is blocked."""
+    global RESOLVERS, USE_RAW
+    servers = []
+    for s in (custom or DEFAULT_RESOLVERS):
+        s = s.strip()
+        try:
+            socket.inet_aton(s)
+            servers.append(s)
+        except OSError:
+            pass
+    if not servers:
+        servers = list(DEFAULT_RESOLVERS)
+
+    def alive(s):
+        try:
+            return dns_query("example.com", 1, s, 1.5)[0] == 0
+        except Exception:
+            return False
+
+    with cf.ThreadPoolExecutor(max_workers=len(servers)) as ex:
+        flags = list(ex.map(alive, servers))
+    good = [s for s, ok in zip(servers, flags) if ok]
+    RESOLVERS = good or servers
+    USE_RAW = bool(good)
+    return USE_RAW
 
 
 def wildcard_ips(domain):
@@ -218,14 +458,31 @@ def wildcard_ips(domain):
     return ips
 
 
-def resolve_all(hosts, threads, wild):
+def _shutdown_now(ex, futs):
+    for f in futs:
+        f.cancel()
+    ex.shutdown(wait=False)
+
+
+def resolve_all(hosts, threads, wild, sp=None, label="Resolving"):
     live = {}
-    with cf.ThreadPoolExecutor(max_workers=threads) as ex:
+    total = len(hosts)
+    done = 0
+    ex = cf.ThreadPoolExecutor(max_workers=threads)
+    futs = {}
+    try:
         futs = {ex.submit(resolve, h): h for h in hosts}
         for fut in cf.as_completed(futs):
             ips = fut.result()
             if ips and not (wild and set(ips) <= wild):
                 live[futs[fut]] = ips
+            done += 1
+            if sp is not None and done % 25 == 0:
+                sp.text = "{} {}/{} ({} live)".format(label, done, total, len(live))
+    except KeyboardInterrupt:
+        _shutdown_now(ex, futs)
+        raise
+    ex.shutdown(wait=False)
     return live
 
 
@@ -257,10 +514,16 @@ def _info(url, status, server, body):
 
 def probe_all(hosts, threads):
     res = {}
-    with cf.ThreadPoolExecutor(max_workers=threads) as ex:
+    ex = cf.ThreadPoolExecutor(max_workers=threads)
+    futs = {}
+    try:
         futs = {ex.submit(probe, h): h for h in hosts}
         for fut in cf.as_completed(futs):
             res[futs[fut]] = fut.result()
+    except KeyboardInterrupt:
+        _shutdown_now(ex, futs)
+        raise
+    ex.shutdown(wait=False)
     return res
 
 
@@ -282,6 +545,100 @@ def save(path, rows):
             f.write("\n".join(r["subdomain"] for r in rows) + "\n")
 
 
+# ------------------------------------------------------------ self-update
+def _ver(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v)) or (0,)
+
+
+def _script_version(text):
+    m = re.search(r'^__version__\s*=\s*"([^"]+)"', text, re.M)
+    return m.group(1) if m else None
+
+
+def do_update():
+    """Update Sublist to the latest version from GitHub.
+    - installed with `git clone`  -> git pull
+    - otherwise                   -> download Sublist.py from REPO and replace it
+    """
+    me = os.path.realpath(os.path.abspath(__file__))
+    folder = os.path.dirname(me)
+    print("[*] Current version: v{}".format(__version__))
+
+    # 1) git clone installs (the recommended way)
+    if os.path.isdir(os.path.join(folder, ".git")) and shutil.which("git"):
+        print("[*] Git repository detected, running 'git pull' ...")
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        try:
+            p = subprocess.run(["git", "-C", folder, "pull", "--ff-only"],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               stdin=subprocess.DEVNULL, universal_newlines=True,
+                               timeout=120, env=env)
+        except Exception as e:
+            print("[!] git failed ({})".format(type(e).__name__))
+            return 1
+        print(p.stdout.strip())
+        if p.returncode != 0:
+            print("[!] Update failed. If you edited Sublist.py yourself, run "
+                  "'git stash' (or 'git checkout Sublist.py') in {} and try again.".format(folder))
+            return 1
+        try:
+            with open(me, encoding="utf-8", errors="ignore") as f:
+                new = _script_version(f.read())
+        except OSError:
+            new = None
+        if new and _ver(new) > _ver(__version__):
+            print("[+] Updated: v{} -> v{}".format(__version__, new))
+        else:
+            print("[+] You already have the latest version (v{}).".format(__version__))
+        return 0
+
+    # 2) plain file installs: download the new Sublist.py
+    if "YOUR_GITHUB_USERNAME" in REPO:
+        print("[!] Update source is not configured.")
+        print("    Open {} and set REPO = \"username/Sublist\" at the top.".format(me))
+        return 1
+    url = RAW_URL.format(repo=REPO, branch=BRANCH, script=SCRIPT_NAME)
+    print("[*] Checking {} ...".format(url))
+    try:
+        code = http_get(url, 30)
+    except Exception as e:
+        print("[!] Could not download the update ({}).".format(type(e).__name__))
+        return 1
+
+    remote = _script_version(code)
+    if not remote or "def main" not in code:
+        print("[!] Downloaded file does not look like Sublist. Update cancelled.")
+        return 1
+    try:
+        compile(code, SCRIPT_NAME, "exec")
+    except SyntaxError:
+        print("[!] Downloaded file is broken. Update cancelled.")
+        return 1
+    if _ver(remote) <= _ver(__version__):
+        print("[+] You already have the latest version (v{}).".format(__version__))
+        return 0
+
+    try:
+        shutil.copy2(me, me + ".bak")
+        tmp = me + ".new"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(code)
+        try:
+            shutil.copymode(me, tmp)
+        except OSError:
+            pass
+        os.replace(tmp, me)
+    except PermissionError:
+        print("[!] Permission denied. Try: sudo {} -update".format(
+            "python3 " + me if not os.access(me, os.X_OK) else me))
+        return 1
+    except OSError as e:
+        print("[!] Update failed ({}).".format(e))
+        return 1
+    print("[+] Updated: v{} -> v{}  (backup: {}.bak)".format(__version__, remote, me))
+    return 0
+
+
 # ------------------------------------------------------------ main
 class SublistParser(argparse.ArgumentParser):
     """Prints the Sublist banner above the help text."""
@@ -297,9 +654,10 @@ def build_parser():
         description="Sublist - subdomain finder by Sujoy Karmakar. "
                     "Use only on domains you are authorized to test.",
         epilog="examples:\n"
-               "  python Sublist.py -d example.com\n"
-               "  python Sublist.py -d example.com -b -p --probe -o result.json\n"
-               "  python Sublist.py -d example.com -b -w words.txt -t 100 -q",
+               "  Sublist -d example.com\n"
+               "  Sublist -d example.com -b -p --probe -o result.json\n"
+               "  Sublist -d example.com -b -w words.txt -t 200 -q\n"
+               "  Sublist -update",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-d", "--domain", help="target domain (example.com)")
     ap.add_argument("-b", "--brute", action="store_true", help="enable DNS brute-force (active)")
@@ -308,9 +666,16 @@ def build_parser():
     ap.add_argument("--no-passive", action="store_true", help="skip passive sources")
     ap.add_argument("--no-resolve", action="store_true", help="do not DNS-validate results")
     ap.add_argument("--probe", action="store_true", help="HTTP probe live hosts (status, title, server)")
-    ap.add_argument("-t", "--threads", type=int, default=50, help="threads (default 50)")
+    ap.add_argument("-t", "--threads", type=int, default=100, help="threads (default 100)")
+    ap.add_argument("--timeout", type=int, default=40,
+                    help="max seconds to wait for passive sources (default 40)")
+    ap.add_argument("-r", "--resolvers",
+                    help="comma-separated DNS resolvers (default 1.1.1.1,8.8.8.8,9.9.9.9)")
     ap.add_argument("-o", "--output", help="save results (.txt / .json / .csv)")
     ap.add_argument("-q", "--quiet", action="store_true", help="print only results")
+    ap.add_argument("-U", "-update", "--update", action="store_true", dest="update",
+                    help="update Sublist to the latest version")
+    ap.add_argument("-V", "--version", action="store_true", help="show version and exit")
     return ap
 
 
@@ -324,6 +689,14 @@ def main():
 
     args = ap.parse_args()
 
+    if args.version:
+        print("Sublist v{}".format(__version__))
+        sys.exit(0)
+
+    if args.update:
+        log(BANNER)
+        sys.exit(do_update())
+
     if not args.domain:
         ap.print_help()
         sys.exit("\nError: -d/--domain is required")
@@ -332,41 +705,51 @@ def main():
     if not DOMAIN_RE.match(domain):
         sys.exit("Error: invalid domain '{}'".format(args.domain))
 
+    threads = max(1, min(args.threads, 1000))
+
     log(BANNER, args.quiet)
     log("[*] Target: {}".format(domain), args.quiet)
     start = time.time()
     found = set()
 
     if not args.no_passive:
-        found |= passive_enum(domain, args.quiet)
+        found |= passive_enum(domain, args.quiet, max(5, args.timeout))
 
     if args.brute:
         words = load_words(args.wordlist)
         log("[*] Brute-forcing {} words...".format(len(words)), args.quiet)
         found |= {"{}.{}".format(w, domain) for w in words}
 
-    if args.permute and found:
-        extra = permutations(found, domain)
-        log("[*] Permutations: {} extra candidates".format(len(extra)), args.quiet)
-        found |= extra
-
     if not found:
         sys.exit("No candidates found. Try --brute or check your internet connection.")
 
     if args.no_resolve:
+        if args.permute:
+            extra = permutations(found, domain)
+            log("[*] Permutations: {} extra candidates".format(len(extra)), args.quiet)
+            found |= extra
         results = {h: [] for h in found}
     else:
+        custom = args.resolvers.split(",") if args.resolvers else None
+        init_dns(custom)
         wild = wildcard_ips(domain)
         if wild:
-            log("[!] Wildcard DNS detected ({}), filtering fake results".format(", ".join(sorted(wild))),
-                args.quiet)
-        with Spinner("Resolving {} candidates".format(len(found)), args.quiet):
-            results = resolve_all(found, args.threads, wild)
+            log("[!] Wildcard DNS detected, filtering fake results", args.quiet)
+
+        with Spinner("Resolving {} candidates".format(len(found)), args.quiet) as sp:
+            results = resolve_all(found, threads, wild, sp)
+
+        if args.permute and results:
+            extra = permutations(list(results), domain) - found
+            if extra:
+                log("[*] Permutations: {} extra candidates".format(len(extra)), args.quiet)
+                with Spinner("Resolving permutations", args.quiet) as sp:
+                    results.update(resolve_all(extra, threads, wild, sp, "Permutations"))
 
     probes = {}
     if args.probe and results:
         with Spinner("HTTP probing {} hosts".format(len(results)), args.quiet):
-            probes = probe_all(list(results), min(args.threads, 30))
+            probes = probe_all(list(results), min(threads, 50))
 
     rows = []
     for host in sorted(results):
