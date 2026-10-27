@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __author__ = "Sujoy Karmakar"
 
 # ---- update settings -------------------------------------------------------
@@ -53,6 +53,8 @@ KEY_ENV = {
     "bevigil": "BEVIGIL_API_KEY",
 }
 API_KEYS = {}
+# Sublist also reuses the keys from subfinder's provider-config.yaml (if present)
+SUBFINDER_CFG = os.path.expanduser("~/.config/subfinder/provider-config.yaml")
 # ----------------------------------------------------------------------------
 
 BANNER = r"""
@@ -201,10 +203,39 @@ def clean(names, domain):
     return out
 
 
-def load_keys():
-    """Read API keys from ~/.sublist.json and environment variables
-    (environment wins)."""
+def _keys_from_subfinder():
+    """Tiny parser for subfinder's provider-config.yaml (no PyYAML needed)."""
     keys = {}
+    cur = None
+    try:
+        with open(SUBFINDER_CFG, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.rstrip()
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                m = re.match(r"^([A-Za-z0-9_]+):\s*(.*)$", line)
+                if m:
+                    cur = m.group(1).lower()
+                    rest = m.group(2).strip()
+                    if cur in KEY_ENV and rest.startswith("[") and rest != "[]":
+                        v = rest.strip("[]").split(",")[0].strip().strip("'\"")
+                        if v:
+                            keys[cur] = v
+                    continue
+                m = re.match(r"^\s*-\s*(.+)$", line)
+                if m and cur in KEY_ENV and cur not in keys:
+                    v = m.group(1).strip().strip("'\"")
+                    if v:
+                        keys[cur] = v
+    except OSError:
+        pass
+    return keys
+
+
+def load_keys():
+    """Read API keys from subfinder's config, ~/.sublist.json and environment
+    variables (later ones win: environment > ~/.sublist.json > subfinder)."""
+    keys = _keys_from_subfinder()
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             cfg = json.load(f)
@@ -963,7 +994,7 @@ def build_parser():
                "  Sublist -d example.com\n"
                "  Sublist -d example.com -b -p -R --probe -o result.json\n"
                "  Sublist -d example.com -b -w words.txt -t 200 -q\n"
-               "  Sublist -d example.com -v          (show which sources worked)\n"
+               "  Sublist -d example.com -a -v       (also keep names without live DNS)\n"
                "  Sublist -update\n"
                "\n"
                "more results with free API keys (env vars or ~/.sublist.json):\n"
@@ -976,6 +1007,9 @@ def build_parser():
     ap.add_argument("-p", "--permute", action="store_true", help="try permutations of found names")
     ap.add_argument("-R", "--recursive", action="store_true",
                     help="also brute-force a small wordlist under every found subdomain")
+    ap.add_argument("-a", "--all", action="store_true",
+                    help="also list passive names that do not resolve in DNS "
+                         "(like subfinder does; marked [no DNS])")
     ap.add_argument("--no-passive", action="store_true", help="skip passive sources")
     ap.add_argument("--no-resolve", action="store_true", help="do not DNS-validate results")
     ap.add_argument("--probe", action="store_true", help="HTTP probe live hosts (status, title, server)")
@@ -1032,9 +1066,11 @@ def main():
         log("[*] No API keys set (adding free keys finds more subdomains, see -h)", args.quiet)
     start = time.time()
     found = set()
+    passive_names = set()
 
     if not args.no_passive:
-        found |= passive_enum(domain, args.quiet, max(5, args.timeout), args.verbose)
+        passive_names = passive_enum(domain, args.quiet, max(5, args.timeout), args.verbose)
+        found |= passive_names
 
     if args.brute:
         words = load_words(args.wordlist)
@@ -1061,6 +1097,7 @@ def main():
         if from_dns:
             log("[+] DNS records (NS/MX/SRV): {} names".format(len(from_dns)), args.quiet)
             found |= from_dns
+            passive_names |= from_dns
 
         if not found:
             sys.exit("No candidates found. Try --brute or check your internet connection.")
@@ -1100,20 +1137,31 @@ def main():
                 with Spinner("Resolving recursive", args.quiet) as sp:
                     results.update(resolve_all(extra, threads, wild, sp, "Recursive"))
 
+    unresolved = set()
+    if args.all and not args.no_resolve:
+        unresolved = passive_names - set(results)
+        if unresolved:
+            log("[*] Keeping {} passive names without live DNS (-a)".format(len(unresolved)),
+                args.quiet)
+
     probes = {}
     if args.probe and results:
         with Spinner("HTTP probing {} hosts".format(len(results)), args.quiet):
             probes = probe_all(list(results), min(threads, 50))
 
     rows = []
-    for host in sorted(results):
-        row = {"subdomain": host, "ips": results[host]}
+    for host in sorted(set(results) | unresolved):
+        row = {"subdomain": host, "ips": results.get(host, [])}
         row.update(probes.get(host, {}))
+        if host in unresolved:
+            row["resolved"] = False
         rows.append(row)
 
     log("", args.quiet)
     for r in rows:
         line = r["subdomain"]
+        if r.get("resolved") is False:
+            line += "  [no DNS]"
         if args.probe and r.get("status"):
             line += "  [{}] {}  {}".format(r["status"], r.get("server", ""), r.get("title", ""))
         print(line)
