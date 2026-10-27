@@ -1,0 +1,24 @@
+[MASTER]
+ignore=CVS
+
+[FORMAT]
+max-line-length=140
+
+[MESSAGES CONTROL]
+disable=
+    broad-exception-caught,
+    consider-using-f-string,
+    import-outside-toplevel,
+    line-too-long,
+    missing-class-docstring,
+    missing-function-docstring,
+    missing-module-docstring,
+    reimported,
+    subprocess-run-check,
+    too-many-lines,
+    too-many-locals,
+    unused-argument,
+    global-statement
+
+[REPORTS]
+score=yes
