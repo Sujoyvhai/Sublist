@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __author__ = "Sujoy Karmakar"
 
 # ---- update settings -------------------------------------------------------
@@ -37,6 +37,22 @@ REPO = "YOUR_GITHUB_USERNAME/Sublist"
 BRANCH = "main"
 SCRIPT_NAME = "Sublist.py"
 RAW_URL = "https://raw.githubusercontent.com/{repo}/{branch}/{script}"
+# ----------------------------------------------------------------------------
+
+# ---- optional API keys -------------------------------------------------------
+# Keys are optional, but each one adds a big extra data source (most have a
+# free tier). Set them as environment variables OR in ~/.sublist.json:
+#   {"virustotal": "KEY", "securitytrails": "KEY", "chaos": "KEY"}
+CONFIG_PATH = os.path.expanduser("~/.sublist.json")
+KEY_ENV = {
+    "virustotal": "VIRUSTOTAL_API_KEY",
+    "securitytrails": "SECURITYTRAILS_API_KEY",
+    "chaos": "CHAOS_API_KEY",
+    "shodan": "SHODAN_API_KEY",
+    "fullhunt": "FULLHUNT_API_KEY",
+    "bevigil": "BEVIGIL_API_KEY",
+}
+API_KEYS = {}
 # ----------------------------------------------------------------------------
 
 BANNER = r"""
@@ -52,7 +68,7 @@ UA = "Mozilla/5.0 (compatible; Sublist/{})".format(__version__)
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?$")
 
-DEFAULT_WORDS = list(dict.fromkeys("""
+_BASE_WORDS = """
 www www1 www2 www3 mail mail1 mail2 mail3 email mailer mailgate relay ftp ftp2 sftp smtp smtp1 smtp2
 pop pop3 imap webmail exchange owa autodiscover autoconfig lyncdiscover sip webex meet meeting
 conference zoom ns ns1 ns2 ns3 ns4 dns dns1 dns2 mx mx1 mx2 admin administrator adm admin1 admin2
@@ -84,7 +100,41 @@ services svc us eu uk de fr asia in au ca sg jp br origin edge cache1 cache2 mir
 status2 health ping time ntp host1 host2 node1 node2 node3 master slave primary secondary
 standby test-env dev-api api-dev api-test api-staging api-prod staging-api student students
 library edu school hospital
-""".split()))
+"""
+
+_EXTRA_WORDS = """
+apm api-gateway apigw appdev appstore archive aws azure gcp bastion bounce campus career cas
+catalog chat chatbot check cluster connect content customer-portal cust dc dc1 dc2 dealer devops
+dev-portal dhcp direct dmz domain domains e-learning elearning ecommerce edge1 edge2 emp employee
+employees enterprise expo faq feed feeds finance forms front frontend home hub iam info infra
+ingress inside insight int inventory iot jump jumpbox kiosk lb1 lb2 legacy link links list lists
+local mailing marketing net network office365 ops pages pki pos print printer promo public pub rds
+reset resources review rss sales scan schedule scm sdk security selfservice site sites sms snmp
+social solutions sp spa survey sync syslog team teams tech ticket tickets trust update updates
+vdi view vm waf webapp webdav webhooks websocket webservice whois win wireless www4 xml zone
+mail4 mx3 smtp3 imap2 pop2 relay2 ns5 ns6 vpn3 gw1 gw2 node4 node5 app3 web3 api4 cdn3 static1
+static2 img1 img2 media1 files1 old2 new2 test3 dev3 stage2 staging2 uat2 prod2 beta2 demo3
+admin3 portal2 portal3 login2 sso2 auth2 oauth2 ssl2 secure2 pay2 shop3 store2 blog2 news2 wiki2
+"""
+
+DEFAULT_WORDS = list(dict.fromkeys((_BASE_WORDS + " " + _EXTRA_WORDS).split()))
+
+# small list used for the second level (-R / --recursive): x.<found-sub>.domain
+RECURSIVE_WORDS = """
+www mail api dev test staging stage beta admin portal app web intranet internal vpn cdn static
+assets db ftp smtp ns1 ns2 git ci jenkins monitor grafana kibana login auth sso old new demo qa
+uat prod preprod int stg v1 v2 backend console panel manage
+""".split()
+
+# prefixes used by the permutation engine (-p)
+PERM_PREFIXES = ["dev", "test", "stage", "staging", "prod", "uat", "beta", "old", "new",
+                 "internal", "int", "qa", "pre", "demo", "api", "admin", "v1", "v2", "backup", "stg"]
+
+# SRV records often point at hidden hosts (sip, xmpp, ldap, autodiscover ...)
+SRV_LABELS = ["_sip._tcp", "_sip._udp", "_sips._tcp", "_xmpp-server._tcp", "_xmpp-client._tcp",
+              "_autodiscover._tcp", "_ldap._tcp", "_kerberos._tcp", "_imaps._tcp",
+              "_imap._tcp", "_submission._tcp", "_pop3s._tcp", "_caldavs._tcp",
+              "_carddavs._tcp", "_h323cs._tcp", "_minecraft._tcp", "_matrix._tcp"]
 
 
 # ------------------------------------------------------------------ helpers
@@ -129,8 +179,11 @@ class Spinner:
         return False
 
 
-def http_get(url, timeout=20):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
+def http_get(url, timeout=20, headers=None):
+    h = {"User-Agent": UA}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", errors="ignore")
 
@@ -148,9 +201,35 @@ def clean(names, domain):
     return out
 
 
+def load_keys():
+    """Read API keys from ~/.sublist.json and environment variables
+    (environment wins)."""
+    keys = {}
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg = json.load(f)
+        src = cfg.get("api_keys", cfg)
+        for k in KEY_ENV:
+            v = src.get(k)
+            if isinstance(v, str) and v.strip():
+                keys[k] = v.strip()
+    except (OSError, ValueError, AttributeError):
+        pass
+    for k, env in KEY_ENV.items():
+        v = os.environ.get(env, "").strip()
+        if v:
+            keys[k] = v
+    return keys
+
+
+def _scrape(html, domain):
+    return re.findall(r"([a-z0-9][a-z0-9.\-]*\.{})".format(re.escape(domain)), html.lower())
+
+
 # ------------------------------------------------------------ passive sources
+# ---- no key needed ----
 def src_crtsh(domain):
-    data = json.loads(http_get("https://crt.sh/?q=%25.{}&output=json".format(domain), 30))
+    data = json.loads(http_get("https://crt.sh/?q=%25.{}&output=json".format(domain), 45))
     names = []
     for row in data:
         names.extend(row.get("name_value", "").split("\n"))
@@ -158,18 +237,36 @@ def src_crtsh(domain):
 
 
 def src_certspotter(domain):
-    data = json.loads(http_get(
-        "https://api.certspotter.com/v1/issuances?domain={}"
-        "&include_subdomains=true&expand=dns_names".format(domain), 25))
     names = []
-    for row in data:
-        names.extend(row.get("dns_names", []))
+    after = ""
+    for page in range(6):                       # up to ~600 certificates
+        url = ("https://api.certspotter.com/v1/issuances?domain={}"
+               "&include_subdomains=true&expand=dns_names".format(domain))
+        if after:
+            url += "&after=" + after
+        try:
+            data = json.loads(http_get(url, 25))
+        except Exception:
+            if names:                           # keep what we already have
+                break
+            raise
+        if not data:
+            break
+        for row in data:
+            names.extend(row.get("dns_names", []))
+        after = str(data[-1].get("id", ""))
+        if not after or len(data) < 100:
+            break
     return names
+
+
+def src_digitorus(domain):
+    return _scrape(http_get("https://certificatedetails.com/{}".format(domain), 25), domain)
 
 
 def src_hackertarget(domain):
     text = http_get("https://api.hackertarget.com/hostsearch/?q={}".format(domain), 20)
-    if "error" in text.lower()[:50]:
+    if "error" in text.lower()[:50] or "api count exceeded" in text.lower():
         return []
     return [line.split(",")[0] for line in text.splitlines()]
 
@@ -180,15 +277,35 @@ def src_otx(domain):
     return [r.get("hostname", "") for r in data.get("passive_dns", [])]
 
 
+def src_otx_urls(domain):
+    """AlienVault OTX also stores URLs - their hostnames reveal more subdomains."""
+    names = []
+    for page in (1, 2, 3):
+        try:
+            data = json.loads(http_get(
+                "https://otx.alienvault.com/api/v1/indicators/domain/{}/url_list"
+                "?limit=500&page={}".format(domain, page), 25))
+        except Exception:
+            if names:
+                break
+            raise
+        rows = data.get("url_list", [])
+        for r in rows:
+            names.append(r.get("hostname", ""))
+        if not data.get("has_next"):
+            break
+    return names
+
+
 def src_anubis(domain):
     return json.loads(http_get("https://jldc.me/anubis/subdomains/{}".format(domain), 20))
 
 
 def src_wayback(domain):
     url = ("https://web.archive.org/cdx/search/cdx?url={}&matchType=domain&output=text"
-           "&fl=original&collapse=urlkey&limit=20000".format(domain))
+           "&fl=original&collapse=urlkey&limit=50000".format(domain))
     names = []
-    for line in http_get(url, 30).splitlines():
+    for line in http_get(url, 40).splitlines():
         m = re.match(r"^[a-z]+://([^/:?#@]*@)?([^/:?#]+)", line.strip().lower())
         if m:
             names.append(m.group(2))
@@ -206,8 +323,7 @@ def src_urlscan(domain):
 
 
 def src_rapiddns(domain):
-    html = http_get("https://rapiddns.io/subdomain/{}?full=1".format(domain), 25).lower()
-    return re.findall(r"([a-z0-9][a-z0-9.\-]*\.{})".format(re.escape(domain)), html)
+    return _scrape(http_get("https://rapiddns.io/subdomain/{}?full=1".format(domain), 25), domain)
 
 
 def src_threatminer(domain):
@@ -216,56 +332,164 @@ def src_threatminer(domain):
     return data.get("results", [])
 
 
+def src_threatcrowd(domain):
+    data = json.loads(http_get(
+        "https://www.threatcrowd.org/searchApi/v2/domain/report/?domain={}".format(domain), 20))
+    return data.get("subdomains", [])
+
+
+def src_sublist3r(domain):
+    data = json.loads(http_get("https://api.sublist3r.com/search.php?domain={}".format(domain), 20))
+    return data if isinstance(data, list) else []
+
+
 def src_columbus(domain):
     data = json.loads(http_get(
         "https://columbus.elmasy.com/api/subdomains/{}".format(domain), 25))
     return ["{}.{}".format(x, domain) for x in data if isinstance(x, str)]
 
 
+# ---- need a (free) API key ----
+def src_virustotal(domain):
+    key = API_KEYS["virustotal"]
+    names = []
+    url = "https://www.virustotal.com/api/v3/domains/{}/subdomains?limit=40".format(domain)
+    for _ in range(5):                          # free tier: 4 requests / minute
+        try:
+            data = json.loads(http_get(url, 25, {"x-apikey": key}))
+        except Exception:
+            if names:
+                break
+            raise
+        names.extend(i.get("id", "") for i in data.get("data", []))
+        url = data.get("links", {}).get("next")
+        if not url:
+            break
+    return names
+
+
+def src_securitytrails(domain):
+    data = json.loads(http_get(
+        "https://api.securitytrails.com/v1/domain/{}/subdomains"
+        "?children_only=false&include_inactive=true".format(domain),
+        30, {"APIKEY": API_KEYS["securitytrails"]}))
+    return ["{}.{}".format(s, domain) for s in data.get("subdomains", [])]
+
+
+def src_chaos(domain):
+    data = json.loads(http_get(
+        "https://dns.projectdiscovery.io/dns/{}/subdomains".format(domain),
+        25, {"Authorization": API_KEYS["chaos"]}))
+    return ["{}.{}".format(s, domain) for s in data.get("subdomains", [])]
+
+
+def src_shodan(domain):
+    data = json.loads(http_get(
+        "https://api.shodan.io/dns/domain/{}?key={}".format(domain, API_KEYS["shodan"]), 25))
+    names = ["{}.{}".format(s, domain) for s in data.get("subdomains", [])]
+    for rec in data.get("data", []):
+        sub = rec.get("subdomain")
+        if sub:
+            names.append("{}.{}".format(sub, domain))
+    return names
+
+
+def src_fullhunt(domain):
+    data = json.loads(http_get(
+        "https://fullhunt.io/api/v1/domain/{}/subdomains".format(domain),
+        25, {"X-API-KEY": API_KEYS["fullhunt"]}))
+    return data.get("hosts", [])
+
+
+def src_bevigil(domain):
+    data = json.loads(http_get(
+        "https://osint.bevigil.com/api/{}/subdomains/".format(domain),
+        25, {"X-Access-Token": API_KEYS["bevigil"]}))
+    return data.get("subdomains", [])
+
+
 SOURCES = {
     "crtsh": src_crtsh,
     "certspotter": src_certspotter,
+    "digitorus": src_digitorus,
     "hackertarget": src_hackertarget,
     "otx": src_otx,
+    "otx-urls": src_otx_urls,
     "anubis": src_anubis,
     "wayback": src_wayback,
     "urlscan": src_urlscan,
     "rapiddns": src_rapiddns,
     "threatminer": src_threatminer,
+    "threatcrowd": src_threatcrowd,
+    "sublist3r": src_sublist3r,
     "columbus": src_columbus,
 }
 
+# only used when the matching API key is configured
+KEY_SOURCES = {
+    "virustotal": src_virustotal,
+    "securitytrails": src_securitytrails,
+    "chaos": src_chaos,
+    "shodan": src_shodan,
+    "fullhunt": src_fullhunt,
+    "bevigil": src_bevigil,
+}
 
-def _run_source(fn, domain):
-    """Run one source. Retry once on a quick failure, never on a timeout."""
-    for attempt in (1, 2):
+# crt.sh is the biggest source but often slow/flaky, so it gets more tries
+RETRY = {"crtsh": 3}
+RETRY_ON_TIMEOUT = {"crtsh"}
+
+
+def active_sources():
+    srcs = dict(SOURCES)
+    for name, fn in KEY_SOURCES.items():
+        if name in API_KEYS:
+            srcs[name] = fn
+    return srcs
+
+
+def _run_source(name, fn, domain):
+    """Run one source. Returns (names, error_text_or_None)."""
+    attempts = RETRY.get(name, 2)
+    err = "failed"
+    for attempt in range(1, attempts + 1):
         try:
-            return fn(domain)
+            return fn(domain), None
+        except urllib.error.HTTPError as e:
+            err = "HTTP {}".format(e.code)
+            if e.code in (400, 401, 403, 404):
+                break
         except Exception as e:
             timed_out = isinstance(e, (socket.timeout, TimeoutError)) or \
                 isinstance(getattr(e, "reason", None), socket.timeout)
-            if attempt == 2 or timed_out:
+            err = "timeout" if timed_out else type(e).__name__
+            if timed_out and name not in RETRY_ON_TIMEOUT:
                 break
-            time.sleep(1)
-    return []
+        if attempt < attempts:
+            time.sleep(1.5 * attempt)
+    return [], err
 
 
-def passive_enum(domain, quiet=False, deadline=40):
+def passive_enum(domain, quiet=False, deadline=60, verbose=False):
     """Query all passive sources in parallel. Slow sources are cut off at
     `deadline` seconds so one bad source can't block the whole scan."""
+    srcs = active_sources()
     found = set()
+    stats = {}
     lock = threading.Lock()
 
-    def worker(fn):
+    def worker(name, fn):
         try:
-            names = clean(_run_source(fn, domain), domain)
-        except Exception:
-            names = set()
+            raw, err = _run_source(name, fn, domain)
+            names = clean(raw, domain)
+        except Exception as e:
+            names, err = set(), type(e).__name__
         with lock:
             found.update(names)
+            stats[name] = (len(names), err)
 
-    threads = [threading.Thread(target=worker, args=(fn,), daemon=True)
-               for fn in SOURCES.values()]
+    threads = [threading.Thread(target=worker, args=(n, fn), daemon=True)
+               for n, fn in srcs.items()]
     for t in threads:
         t.start()
 
@@ -279,7 +503,16 @@ def passive_enum(domain, quiet=False, deadline=40):
 
     with lock:
         result = set(found)
+        snap = dict(stats)
     log("[+] Passive sources: {} candidates".format(len(result)), quiet)
+    if verbose:
+        for name in srcs:
+            if name in snap:
+                n, err = snap[name]
+                state = "FAILED ({})".format(err) if err else "{} names".format(n)
+            else:
+                state = "too slow, skipped (raise --timeout)"
+            log("    {:<15} {}".format(name, state), quiet)
     return result
 
 
@@ -292,18 +525,28 @@ def load_words(path):
     return [w for w in dict.fromkeys(words) if LABEL_RE.match(w)]
 
 
-def permutations(subs, domain):
-    """Simple alterations: dev-api, api-dev, api2 ..."""
-    prefixes = ["dev", "test", "stage", "staging", "prod", "uat", "beta", "old", "new", "internal"]
+def permutations(subs, domain, limit=50000):
+    """Alterations of the left-most label: dev-api, api-dev, api2, api-3 ...
+    (built under the same parent, so a.b.example.com -> dev-a.b.example.com)."""
+    known = set(subs)
     out = set()
-    for s in subs:
-        label = s[: -(len(domain) + 1)].split(".")[0]
-        for p in prefixes:
-            out.add("{}-{}.{}".format(p, label, domain))
-            out.add("{}-{}.{}".format(label, p, domain))
-        for i in range(1, 4):
-            out.add("{}{}.{}".format(label, i, domain))
-    return out - set(subs)
+    for s in sorted(known):
+        if "." not in s:
+            continue
+        label, parent = s.split(".", 1)
+        if not parent.endswith(domain):
+            continue
+        for p in PERM_PREFIXES:
+            out.add("{}-{}.{}".format(p, label, parent))
+            out.add("{}-{}.{}".format(label, p, parent))
+        m = re.match(r"^(.*?)(\d+)$", label)
+        base = m.group(1) if m else label
+        for i in range(1, 6):
+            out.add("{}{}.{}".format(base, i, parent))
+            out.add("{}-{}.{}".format(base.rstrip("-"), i, parent))
+    out = [h for h in out - known if LABEL_RE.match(h.split(".", 1)[0])]
+    random.shuffle(out)
+    return set(out[:limit])
 
 
 # ------------------------------------------------------------ DNS (fast, raw UDP)
@@ -366,6 +609,12 @@ def _parse_response(buf):
             toks.append(socket.inet_ntop(socket.AF_INET6, rdata))
         elif rtype == 5:
             toks.append("cname:" + _read_name(buf, off).lower())
+        elif rtype == 2:
+            toks.append("ns:" + _read_name(buf, off).lower())
+        elif rtype == 15 and rdlen > 2:
+            toks.append("mx:" + _read_name(buf, off + 2).lower())
+        elif rtype == 33 and rdlen > 6:
+            toks.append("srv:" + _read_name(buf, off + 6).lower())
         off += rdlen
     return rcode, toks
 
@@ -456,6 +705,63 @@ def wildcard_ips(domain):
         rnd = "".join(random.choices(string.ascii_lowercase + string.digits, k=14))
         ips |= set(resolve("{}.{}".format(rnd, domain)))
     return ips
+
+
+def dns_record_names(domain):
+    """Harvest hostnames from the domain's own DNS records: NS, MX and a set of
+    common SRV records. Needs the raw resolver (UDP/53 to public resolvers)."""
+    if not USE_RAW:
+        return set()
+
+    def q(job):
+        host, qtype = job
+        for _ in range(2):
+            try:
+                rcode, toks = dns_query(host, qtype, random.choice(RESOLVERS), 2.0)
+                if rcode == 3:
+                    return []
+                if rcode == 0:
+                    return toks
+            except Exception:
+                continue
+        return []
+
+    jobs = [(domain, 2), (domain, 15)]
+    jobs += [("{}.{}".format(s, domain), 33) for s in SRV_LABELS]
+    names = []
+    with cf.ThreadPoolExecutor(max_workers=10) as ex:
+        for toks in ex.map(q, jobs):
+            for t in toks:
+                if ":" in t and t.split(":", 1)[0] in ("ns", "mx", "srv", "cname"):
+                    names.append(t.split(":", 1)[1])
+    return clean(names, domain)
+
+
+def cname_targets(results, domain):
+    """In-scope hostnames that live hosts point to via CNAME."""
+    out = set()
+    for ips in results.values():
+        for t in ips:
+            if t.startswith("cname:"):
+                out.add(t[6:])
+    return clean(out, domain)
+
+
+def recursive_candidates(live_hosts, domain, threads):
+    """x.<found>.domain for a small wordlist, skipping parents that have
+    wildcard DNS. Limited to 150 parents so it stays fast."""
+    depth = domain.count(".")
+    parents = [h for h in sorted(live_hosts) if h.count(".") - depth <= 2][:150]
+
+    def check(p):
+        return p, wildcard_ips(p)
+
+    cands = set()
+    with cf.ThreadPoolExecutor(max_workers=max(1, min(threads, 30))) as ex:
+        for p, w in ex.map(check, parents):
+            if not w:
+                cands.update("{}.{}".format(x, p) for x in RECURSIVE_WORDS)
+    return cands
 
 
 def _shutdown_now(ex, futs):
@@ -655,24 +961,33 @@ def build_parser():
                     "Use only on domains you are authorized to test.",
         epilog="examples:\n"
                "  Sublist -d example.com\n"
-               "  Sublist -d example.com -b -p --probe -o result.json\n"
+               "  Sublist -d example.com -b -p -R --probe -o result.json\n"
                "  Sublist -d example.com -b -w words.txt -t 200 -q\n"
-               "  Sublist -update",
+               "  Sublist -d example.com -v          (show which sources worked)\n"
+               "  Sublist -update\n"
+               "\n"
+               "more results with free API keys (env vars or ~/.sublist.json):\n"
+               "  VIRUSTOTAL_API_KEY  SECURITYTRAILS_API_KEY  CHAOS_API_KEY\n"
+               "  SHODAN_API_KEY  FULLHUNT_API_KEY  BEVIGIL_API_KEY",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-d", "--domain", help="target domain (example.com)")
     ap.add_argument("-b", "--brute", action="store_true", help="enable DNS brute-force (active)")
     ap.add_argument("-w", "--wordlist", help="custom wordlist file for brute-force")
     ap.add_argument("-p", "--permute", action="store_true", help="try permutations of found names")
+    ap.add_argument("-R", "--recursive", action="store_true",
+                    help="also brute-force a small wordlist under every found subdomain")
     ap.add_argument("--no-passive", action="store_true", help="skip passive sources")
     ap.add_argument("--no-resolve", action="store_true", help="do not DNS-validate results")
     ap.add_argument("--probe", action="store_true", help="HTTP probe live hosts (status, title, server)")
-    ap.add_argument("-t", "--threads", type=int, default=100, help="threads (default 100)")
-    ap.add_argument("--timeout", type=int, default=40,
-                    help="max seconds to wait for passive sources (default 40)")
+    ap.add_argument("-t", "--threads", type=int, default=150, help="threads (default 150)")
+    ap.add_argument("--timeout", type=int, default=60,
+                    help="max seconds to wait for passive sources (default 60)")
     ap.add_argument("-r", "--resolvers",
                     help="comma-separated DNS resolvers (default 1.1.1.1,8.8.8.8,9.9.9.9)")
     ap.add_argument("-o", "--output", help="save results (.txt / .json / .csv)")
     ap.add_argument("-q", "--quiet", action="store_true", help="print only results")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="show how many names each source returned (and which ones failed)")
     ap.add_argument("-U", "-update", "--update", action="store_true", dest="update",
                     help="update Sublist to the latest version")
     ap.add_argument("-V", "--version", action="store_true", help="show version and exit")
@@ -706,24 +1021,29 @@ def main():
         sys.exit("Error: invalid domain '{}'".format(args.domain))
 
     threads = max(1, min(args.threads, 1000))
+    API_KEYS.clear()
+    API_KEYS.update(load_keys())
 
     log(BANNER, args.quiet)
     log("[*] Target: {}".format(domain), args.quiet)
+    if args.verbose and API_KEYS:
+        log("[*] API keys loaded: {}".format(", ".join(sorted(API_KEYS))), args.quiet)
+    elif args.verbose:
+        log("[*] No API keys set (adding free keys finds more subdomains, see -h)", args.quiet)
     start = time.time()
     found = set()
 
     if not args.no_passive:
-        found |= passive_enum(domain, args.quiet, max(5, args.timeout))
+        found |= passive_enum(domain, args.quiet, max(5, args.timeout), args.verbose)
 
     if args.brute:
         words = load_words(args.wordlist)
         log("[*] Brute-forcing {} words...".format(len(words)), args.quiet)
         found |= {"{}.{}".format(w, domain) for w in words}
 
-    if not found:
-        sys.exit("No candidates found. Try --brute or check your internet connection.")
-
     if args.no_resolve:
+        if not found:
+            sys.exit("No candidates found. Try --brute or check your internet connection.")
         if args.permute:
             extra = permutations(found, domain)
             log("[*] Permutations: {} extra candidates".format(len(extra)), args.quiet)
@@ -731,20 +1051,54 @@ def main():
         results = {h: [] for h in found}
     else:
         custom = args.resolvers.split(",") if args.resolvers else None
-        init_dns(custom)
+        raw_mode = init_dns(custom)
+        if args.verbose:
+            log("[*] DNS mode: {}".format(
+                "fast raw UDP ({})".format(", ".join(RESOLVERS)) if raw_mode
+                else "system resolver (UDP/53 to public resolvers is blocked)"), args.quiet)
+
+        from_dns = dns_record_names(domain)
+        if from_dns:
+            log("[+] DNS records (NS/MX/SRV): {} names".format(len(from_dns)), args.quiet)
+            found |= from_dns
+
+        if not found:
+            sys.exit("No candidates found. Try --brute or check your internet connection.")
+
         wild = wildcard_ips(domain)
         if wild:
             log("[!] Wildcard DNS detected, filtering fake results", args.quiet)
 
+        known = set(found)
         with Spinner("Resolving {} candidates".format(len(found)), args.quiet) as sp:
             results = resolve_all(found, threads, wild, sp)
 
+        # follow CNAME targets that point back into the target domain
+        for _ in range(2):
+            extra = cname_targets(results, domain) - known
+            if not extra:
+                break
+            known |= extra
+            log("[*] CNAME targets: {} new candidates".format(len(extra)), args.quiet)
+            with Spinner("Resolving CNAME targets", args.quiet) as sp:
+                results.update(resolve_all(extra, threads, wild, sp, "CNAME"))
+
         if args.permute and results:
-            extra = permutations(list(results), domain) - found
+            extra = permutations(list(results), domain) - known
             if extra:
+                known |= extra
                 log("[*] Permutations: {} extra candidates".format(len(extra)), args.quiet)
                 with Spinner("Resolving permutations", args.quiet) as sp:
                     results.update(resolve_all(extra, threads, wild, sp, "Permutations"))
+
+        if args.recursive and results:
+            with Spinner("Preparing recursive scan", args.quiet):
+                extra = recursive_candidates(list(results), domain, threads) - known
+            if extra:
+                known |= extra
+                log("[*] Recursive: {} extra candidates".format(len(extra)), args.quiet)
+                with Spinner("Resolving recursive", args.quiet) as sp:
+                    results.update(resolve_all(extra, threads, wild, sp, "Recursive"))
 
     probes = {}
     if args.probe and results:
