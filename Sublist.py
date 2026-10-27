@@ -1316,7 +1316,7 @@ def main():
             line += "  [no DNS]"
         if args.probe and r.get("status"):
             line += "  [{}] {}  {}".format(r["status"], r.get("server", ""), r.get("title", ""))
-        print(paint(line))
+        print(line)
 
     log("\n[*] Done: {} subdomains in {:.1f}s".format(len(rows), time.time() - start), args.quiet)
     if args.output:
