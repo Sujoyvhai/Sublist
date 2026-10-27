@@ -27,15 +27,18 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "1.3.0"
+__version__ = "1.5.0"
 __author__ = "Sujoy Karmakar"
 
 # ---- update settings -------------------------------------------------------
 # Used by `Sublist -update` when the tool was NOT installed with `git clone`.
 # Change this to your GitHub "username/repository" before publishing.
 REPO = "YOUR_GITHUB_USERNAME/Sublist"
+WORDLIST_REPO = "Sujoyvhai/subdomin-wordlist"   # auto-downloaded wordlist
+WORDLIST_CACHE = os.path.expanduser("~/.sublist/wordlist.txt")
+WORDLIST_MAX_AGE = 7 * 86400                      # re-check GitHub every 7 days
 BRANCH = "main"
-SCRIPT_NAME = "Sublist.py"
+SCRIPT_NAME = "sublist.py"
 RAW_URL = "https://raw.githubusercontent.com/{repo}/{branch}/{script}"
 # ----------------------------------------------------------------------------
 
@@ -139,9 +142,44 @@ SRV_LABELS = ["_sip._tcp", "_sip._udp", "_sips._tcp", "_xmpp-server._tcp", "_xmp
               "_carddavs._tcp", "_h323cs._tcp", "_minecraft._tcp", "_matrix._tcp"]
 
 
+
+# ------------------------------------------------------------------ hacker colors
+# Matrix-style palette: different shades of green plus a few neon colors.
+# Every output line gets a random one, so the screen "flickers" like a terminal.
+HACKER_COLORS = [46, 82, 118, 154, 40, 34, 48, 49, 51, 45, 226, 208, 201, 196]
+USE_COLOR = True
+
+
+def _color_ok(stream):
+    if not USE_COLOR or os.environ.get("NO_COLOR"):
+        return False
+    try:
+        return stream.isatty()
+    except Exception:
+        return False
+
+
+def paint(text, stream=None, code=None):
+    """Wrap text in a random hacker color (only when writing to a terminal)."""
+    if not _color_ok(stream or sys.stdout):
+        return text
+    code = code if code is not None else random.choice(HACKER_COLORS)
+    return "\033[1;38;5;{}m{}\033[0m".format(code, text)
+
+
+def rainbow(text, stream=None):
+    """Each line of a block gets its own random color (used for the banner)."""
+    return "\n".join(paint(line, stream) for line in text.split("\n"))
+
+
+if os.name == "nt":          # enable ANSI colors on Windows 10+
+    os.system("")
+
 # ------------------------------------------------------------------ helpers
 def log(msg, quiet=False):
     if not quiet:
+        if msg.lstrip().startswith(("[", "    ")) or msg == BANNER:
+            msg = paint(msg, sys.stderr)
         print(msg, file=sys.stderr)
 
 
@@ -158,7 +196,7 @@ class Spinner:
         for ch in itertools.cycle("|/-\\"):
             if self._stop.is_set():
                 break
-            sys.stderr.write("\r[*] {} {}   ".format(self.text, ch))
+            sys.stderr.write("\r" + paint("[*] {} {}   ".format(self.text, ch), sys.stderr))
             sys.stderr.flush()
             time.sleep(0.1)
 
@@ -548,12 +586,64 @@ def passive_enum(domain, quiet=False, deadline=60, verbose=False):
 
 
 # ------------------------------------------------------------ active: brute
-def load_words(path):
-    if not path:
-        return DEFAULT_WORDS
+def _read_words(path):
     with open(path, encoding="utf-8", errors="ignore") as f:
         words = [w.strip().lower() for w in f if w.strip() and not w.startswith("#")]
     return [w for w in dict.fromkeys(words) if LABEL_RE.match(w)]
+
+
+def _download_wordlist(quiet=False):
+    """Find a .txt wordlist inside the GitHub repo (WORDLIST_REPO) and cache it."""
+    import json as _json
+    api = "https://api.github.com/repos/{}/contents/".format(WORDLIST_REPO)
+    files = []
+    stack = [api]
+    while stack and len(files) < 40:
+        raw = http_get(stack.pop(), 20, {"Accept": "application/vnd.github+json"})
+        for it in _json.loads(raw):
+            if it.get("type") == "dir":
+                stack.append(it["url"])
+            elif it.get("type") == "file" and it["name"].lower().endswith(".txt") \
+                    and it["name"].lower() not in ("requirements.txt", "license.txt"):
+                files.append(it)
+    if not files:
+        raise RuntimeError("no .txt wordlist found in repo")
+    # use every list in the repo, merged (biggest first)
+    files.sort(key=lambda x: -x.get("size", 0))
+    words = []
+    for it in files[:5]:
+        words += http_get(it["download_url"], 60).splitlines()
+    os.makedirs(os.path.dirname(WORDLIST_CACHE), exist_ok=True)
+    with open(WORDLIST_CACHE, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(words))
+    return len(files[:5])
+
+
+def auto_wordlist(quiet=False):
+    """Wordlist from your GitHub repo (cached). Falls back to the built-in list."""
+    fresh = os.path.isfile(WORDLIST_CACHE) and \
+        time.time() - os.path.getmtime(WORDLIST_CACHE) < WORDLIST_MAX_AGE
+    if not fresh:
+        try:
+            with Spinner("Fetching wordlist from GitHub ({})".format(WORDLIST_REPO), quiet):
+                n = _download_wordlist(quiet)
+            log("[+] Wordlist updated ({} file(s))".format(n), quiet)
+        except Exception as e:
+            log("[!] Could not download wordlist ({}), using {}".format(
+                type(e).__name__, "cached copy" if os.path.isfile(WORDLIST_CACHE)
+                else "built-in list"), quiet)
+    if os.path.isfile(WORDLIST_CACHE):
+        words = _read_words(WORDLIST_CACHE)
+        if words:
+            # keep the built-in words too, so nothing is lost
+            return list(dict.fromkeys(words + DEFAULT_WORDS))
+    return DEFAULT_WORDS
+
+
+def load_words(path, quiet=False):
+    if not path:
+        return auto_wordlist(quiet)
+    return _read_words(path)
 
 
 def permutations(subs, domain, limit=50000):
@@ -976,26 +1066,67 @@ def do_update():
     return 0
 
 
+
+# ------------------------------------------------------------ install as `sublist`
+def do_install():
+    """Install this script as a command named `sublist` (no 'python' needed)."""
+    me = os.path.realpath(os.path.abspath(__file__))
+    if os.name == "nt":
+        folder = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Sublist")
+        os.makedirs(folder, exist_ok=True)
+        dest = os.path.join(folder, "sublist.py")
+        shutil.copy2(me, dest)
+        bat = os.path.join(folder, "sublist.bat")
+        with open(bat, "w") as f:
+            f.write('@echo off\r\n"{}" "{}" %*\r\n'.format(sys.executable, dest))
+        print("[+] Installed: {}".format(bat))
+        print("[*] Add this folder to PATH once:  {}".format(folder))
+        print("    Then open a NEW terminal and type:  sublist -d example.com")
+        return 0
+    targets = ["/usr/local/bin", os.path.expanduser("~/.local/bin")]
+    for folder in targets:
+        try:
+            os.makedirs(folder, exist_ok=True)
+            dest = os.path.join(folder, "sublist")
+            code = open(me, encoding="utf-8").read()
+            if not code.startswith("#!"):
+                code = "#!/usr/bin/env python3\n" + code
+            with open(dest, "w", encoding="utf-8", newline="\n") as f:
+                f.write(code)
+            os.chmod(dest, 0o755)
+        except OSError:
+            continue
+        print("[+] Installed: {}".format(dest))
+        if folder not in os.environ.get("PATH", "").split(os.pathsep):
+            print("[!] {} is not in PATH. Run:  echo 'export PATH=$PATH:{}' >> ~/.bashrc".format(
+                folder, folder))
+        print("    Now just type:  sublist -d example.com")
+        return 0
+    print("[!] Permission denied. Try:  sudo python3 {} --install".format(me))
+    return 1
+
+
 # ------------------------------------------------------------ main
 class SublistParser(argparse.ArgumentParser):
     """Prints the Sublist banner above the help text."""
 
     def print_help(self, file=None):
-        (file or sys.stdout).write(BANNER + "\n")
+        (file or sys.stdout).write(rainbow(BANNER, file or sys.stdout) + "\n")
         super().print_help(file)
 
 
 def build_parser():
     ap = SublistParser(
-        prog="Sublist",
+        prog="sublist",
         description="Sublist - subdomain finder by Sujoy Karmakar. "
                     "Use only on domains you are authorized to test.",
         epilog="examples:\n"
-               "  Sublist -d example.com\n"
-               "  Sublist -d example.com -b -p -R --probe -o result.json\n"
-               "  Sublist -d example.com -b -w words.txt -t 200 -q\n"
-               "  Sublist -d example.com -a -v       (also keep names without live DNS)\n"
-               "  Sublist -update\n"
+               "  sublist -d example.com             (auto mode: runs -a -b -p -R -v for you)\n"
+               "  sublist -d example.com -o result.json\n"
+               "  sublist -d example.com --passive   (passive sources only, fast)\n"
+               "  sublist -d example.com -b -w words.txt -t 200 -q   (manual mode)\n"
+               "  sublist --install                  (install the 'sublist' command)\n"
+               "  sublist -update\n"
                "\n"
                "more results with free API keys (env vars or ~/.sublist.json):\n"
                "  VIRUSTOTAL_API_KEY  SECURITYTRAILS_API_KEY  CHAOS_API_KEY\n"
@@ -1010,6 +1141,11 @@ def build_parser():
     ap.add_argument("-a", "--all", action="store_true",
                     help="also list passive names that do not resolve in DNS "
                          "(like subfinder does; marked [no DNS])")
+    ap.add_argument("--passive", action="store_true",
+                    help="passive sources only (turns off the automatic -a -b -p -R -v mode)")
+    ap.add_argument("--no-color", action="store_true", help="turn off hacker colors")
+    ap.add_argument("--install", action="store_true",
+                    help="install as the 'sublist' command (no 'python' needed)")
     ap.add_argument("--no-passive", action="store_true", help="skip passive sources")
     ap.add_argument("--no-resolve", action="store_true", help="do not DNS-validate results")
     ap.add_argument("--probe", action="store_true", help="HTTP probe live hosts (status, title, server)")
@@ -1038,12 +1174,19 @@ def main():
 
     args = ap.parse_args()
 
+    global USE_COLOR
+    if args.no_color:
+        USE_COLOR = False
+
     if args.version:
         print("Sublist v{}".format(__version__))
         sys.exit(0)
 
+    if args.install:
+        sys.exit(do_install())
+
     if args.update:
-        log(BANNER)
+        log(rainbow(BANNER, sys.stderr))
         sys.exit(do_update())
 
     if not args.domain:
@@ -1054,11 +1197,20 @@ def main():
     if not DOMAIN_RE.match(domain):
         sys.exit("Error: invalid domain '{}'".format(args.domain))
 
+    # AUTO MODE: `sublist -d example.com` alone turns on -a -b -p -R -v by itself.
+    # Giving any scan flag yourself (-b, -p, -R, -a, --no-passive, ...) or --passive
+    # keeps full manual control.
+    manual = (args.brute or args.permute or args.recursive or args.all
+              or args.no_passive or args.no_resolve or args.wordlist or args.passive)
+    if not manual:
+        args.brute = args.permute = args.recursive = args.all = args.verbose = True
+        log("[*] Auto mode: -a -b -p -R -v enabled", args.quiet)
+
     threads = max(1, min(args.threads, 1000))
     API_KEYS.clear()
     API_KEYS.update(load_keys())
 
-    log(BANNER, args.quiet)
+    log(rainbow(BANNER, sys.stderr) if not args.quiet else "", args.quiet)
     log("[*] Target: {}".format(domain), args.quiet)
     if args.verbose and API_KEYS:
         log("[*] API keys loaded: {}".format(", ".join(sorted(API_KEYS))), args.quiet)
@@ -1073,7 +1225,7 @@ def main():
         found |= passive_names
 
     if args.brute:
-        words = load_words(args.wordlist)
+        words = load_words(args.wordlist, args.quiet)
         log("[*] Brute-forcing {} words...".format(len(words)), args.quiet)
         found |= {"{}.{}".format(w, domain) for w in words}
 
@@ -1164,7 +1316,7 @@ def main():
             line += "  [no DNS]"
         if args.probe and r.get("status"):
             line += "  [{}] {}  {}".format(r["status"], r.get("server", ""), r.get("title", ""))
-        print(line)
+        print(paint(line))
 
     log("\n[*] Done: {} subdomains in {:.1f}s".format(len(rows), time.time() - start), args.quiet)
     if args.output:
